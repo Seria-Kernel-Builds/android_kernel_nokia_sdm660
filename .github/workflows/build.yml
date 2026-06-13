@@ -1,0 +1,204 @@
+name: SDM660 内核构建 (ReSukiSU + AnyKernel3)
+
+env:
+  TZ: Asia/Shanghai
+
+  # ── 内核源码与编译配置 ──
+  ARCH: arm64
+  DEFCONFIG_NAME: PL2_defconfig
+  OUT_DIR: "${{ github.workspace }}/out"
+
+  # ── 工具链版本 ──
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r536225.tar.gz
+
+  # ── AnyKernel3 ──
+  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3
+  ANYKERNEL_BRANCH: master
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_suffix:
+        description: '自定义内核后缀 (如 -Chtholly)'
+        required: false
+        type: string
+        default: '-Chtholly'
+      release:
+        description: '是否发布到 GitHub Releases'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: 构建内核
+    runs-on: ubuntu-22.04
+    outputs:
+      ak3name: ${{ steps.pack_anykernel.outputs.ak3name }}
+      image_name: ${{ steps.prepare_image.outputs.image_name }}
+      builddate: ${{ steps.setup_env.outputs.builddate }}
+    steps:
+      - name: 初始化构建环境
+        id: setup_env
+        run: |
+          echo "builddate=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          # 安装基础编译依赖，以及跨平台 GCC 交叉编译链
+          sudo apt-get install -y build-essential bc gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libssl-dev libfl-dev curl git ccache python2 python2-dev zip unzip
+
+      - name: 检出当前仓库代码
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 1
+
+      - name: 获取 AOSP Clang (r536225)
+        run: |
+          mkdir -p aosp-clang
+          wget -qO clang.tar.gz ${{ env.CLANG_URL }}
+          tar -xf clang.tar.gz -C aosp-clang
+          echo "${{ github.workspace }}/aosp-clang/bin" >> $GITHUB_PATH
+
+      - name: 准备 AnyKernel3
+        run: |
+          git clone --recursive --depth=1 -j $(nproc) \
+            --branch ${{ env.ANYKERNEL_BRANCH }} \
+            ${{ env.ANYKERNEL_REPO }} \
+            AnyKernel3
+
+          # 写入极简 anykernel.sh (针对 SDM660 / PL2)
+          rm -f AnyKernel3/anykernel.sh
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          properties() { '
+          kernel.string=PL2 Custom Kernel with ReSukiSU
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          '; }
+          
+          BLOCK=auto;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          
+          . tools/ak3-core.sh;
+          
+          split_boot;
+          flash_boot;
+          EOF
+
+      - name: 集成 ReSukiSU (Manual Hook)
+        run: |
+          # 运行 ReSukiSU 官方一键集成脚本
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+
+          # 在 defconfig 中追加选项
+          echo -e "\n# ReSukiSU\nCONFIG_KSU=y\nCONFIG_KSU_MANUAL_HOOK=y" >> arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+          echo -e "CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y" >> arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+          echo -e "CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y" >> arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+          echo -e "CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y" >> arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+          
+          # 更新 defconfig
+          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} ${{ env.DEFCONFIG_NAME }}
+
+      - name: 编译内核
+        run: |
+          # 导出后缀（如果输入存在）
+          if [[ -n "${{ inputs.kernel_suffix }}" ]]; then
+            sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ inputs.kernel_suffix }}\"/" arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+            make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} ${{ env.DEFCONFIG_NAME }}
+          fi
+
+          # 调用完整的编译命令
+          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            -j$(nproc)
+
+      - name: 校验内核镜像并打包 AnyKernel3
+        id: pack_anykernel
+        run: |
+          BOOT_DIR="${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot"
+          BUILDDATE="${{ steps.setup_env.outputs.builddate }}"
+          SUFFIX="${{ inputs.kernel_suffix }}"
+          
+          IMAGE_GZ_DTB="${BOOT_DIR}/Image.gz-dtb"
+          if [[ ! -f "${IMAGE_GZ_DTB}" ]]; then
+            echo "::error::未找到内核镜像文件 (Image.gz-dtb)，构建失败！"
+            exit 1
+          fi
+          
+          AK3_NAME="AnyKernel3-PL2${SUFFIX}-${BUILDDATE}"
+          
+          # 复制产物
+          cp -f "${IMAGE_GZ_DTB}" ./AnyKernel3/
+          
+          cd AnyKernel3/
+          zip -q -r "${{ github.workspace }}/${AK3_NAME}.zip" *
+          
+          echo "ak3name=${AK3_NAME}.zip" >> $GITHUB_OUTPUT
+          echo "image_name=Image.gz-dtb" >> $GITHUB_OUTPUT
+
+      - name: 上传 AnyKernel3 刷入包到 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_anykernel.outputs.ak3name }}
+          path: ${{ github.workspace }}/${{ steps.pack_anykernel.outputs.ak3name }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 上传 Image.gz-dtb 原文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_anykernel.outputs.image_name }}
+          path: ${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image.gz-dtb
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: 发布 Release
+    if: inputs.release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release_files
+
+      - name: 创建 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TIME="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
+          TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          TAG_HEAD="pl2-build"
+
+          cat << EOF > release_notes.md
+          ### PL2 SDM660 内核构建
+          - 编译时间: ${TIME_FORM}
+          - 包含组件: ReSukiSU (Manual Hook) + AnyKernel3 刷入包
+          - 产物: \`Image.gz-dtb\` 与 \`AnyKernel3-PL2.zip\`
+          EOF
+
+          shopt -s nullglob
+          RELEASE_FILES=()
+          
+          for f in ./release_files/*/*.zip ./release_files/*/Image.gz-dtb; do
+            RELEASE_FILES+=("$f")
+          done
+
+          gh release create "${TAG_HEAD}-${TIME}" \
+            --repo "${{ github.repository }}" \
+            --title "PL2 Kernel - ${TIME}" \
+            --notes-file release_notes.md \
+            "${RELEASE_FILES[@]}"
