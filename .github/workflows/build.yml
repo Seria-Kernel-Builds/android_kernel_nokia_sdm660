@@ -19,10 +19,10 @@ on:
   workflow_dispatch:
     inputs:
       kernel_suffix:
-        description: '自定义内核后缀 (如 -Chtholly)'
+        description: '自定义内核后缀 (如 -SeriaTvT)'
         required: false
         type: string
-        default: '-Chtholly'
+        default: '-SeriaTvT'
       release:
         description: '是否发布到 GitHub Releases'
         required: true
