@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: '-SeriaTvT'
+      droidspaces:
+        description: '集成 Droidspaces 支持 (Linux 容器, non-GKI)'
+        required: false
+        type: boolean
+        default: false
       release:
         description: '是否发布到 GitHub Releases'
         required: true
@@ -104,6 +109,60 @@ jobs:
           # 更新 defconfig
           make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} ${{ env.DEFCONFIG_NAME }}
 
+      - name: 集成 Droidspaces (可选)
+        if: inputs.droidspaces
+        run: |
+          set -euo pipefail
+          DEFCONFIG="arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG_NAME }}"
+          DS_DIR="${{ github.workspace }}/.github/droidspaces"
+
+          echo "::group::追加 Droidspaces defconfig 片段"
+          # 不直接修改内核源码：仅向 defconfig 追加配置片段，
+          # make defconfig 会按 "后者覆盖前者" 规则合并 (含禁用 PARANOID_NETWORK)。
+          {
+            echo ""
+            echo "# ── Droidspaces support (appended by CI) ──"
+            cat "${DS_DIR}/droidspaces_defconfig.fragment"
+          } >> "${DEFCONFIG}"
+          echo "::endgroup::"
+
+          echo "::group::应用 Droidspaces 内核补丁"
+          # 补丁 1: xt_qtaguid panic 修复 —— 仅当该模块存在于本内核树时应用
+          if [ -f net/netfilter/xt_qtaguid.c ]; then
+            patch -p1 --no-backup-if-mismatch < "${DS_DIR}/01.fix_kernel_panic_in_xt_qtaguid.patch"
+            echo "已应用: 01.fix_kernel_panic_in_xt_qtaguid"
+          else
+            echo "跳过 01 (xt_qtaguid): net/netfilter/xt_qtaguid.c 不存在于本内核 (4.4)"
+          fi
+
+          # 补丁 2: cgroup 文件前缀修复 —— 自适应 cgroup 源码路径
+          # (4.11+ 为 kernel/cgroup/cgroup.c, 4.4/4.9 为 kernel/cgroup.c)
+          if [ -f kernel/cgroup/cgroup.c ]; then
+            CGROUP_SRC="kernel/cgroup/cgroup.c"
+          else
+            CGROUP_SRC="kernel/cgroup.c"
+          fi
+          patch -p1 --no-backup-if-mismatch "${CGROUP_SRC}" < "${DS_DIR}/02.fix_restore_cgroup_file_prefix_handling.patch"
+          echo "已应用: 02.fix_restore_cgroup_file_prefix_handling -> ${CGROUP_SRC}"
+          echo "::endgroup::"
+
+          # 重新生成 defconfig 使新增配置生效
+          make O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} ${{ env.DEFCONFIG_NAME }}
+
+          # 校验关键 (Fatal) 配置已生效
+          echo "::group::校验 Droidspaces 必需配置"
+          CFG="${{ env.OUT_DIR }}/.config"
+          for opt in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_UTS_NS CONFIG_NAMESPACES \
+                     CONFIG_CGROUP_DEVICE CONFIG_DEVTMPFS CONFIG_SECCOMP; do
+            if grep -q "^${opt}=y" "${CFG}"; then
+              echo "  [OK]   ${opt}=y"
+            else
+              echo "::error::Droidspaces 必需配置缺失: ${opt}"
+              exit 1
+            fi
+          done
+          echo "::endgroup::"
+
       - name: 编译内核
         run: |
           # 导出后缀（如果输入存在）
@@ -183,10 +242,15 @@ jobs:
           TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
           TAG_HEAD="pl2-build"
 
+          DROIDSPACES_NOTE=""
+          if [[ "${{ inputs.droidspaces }}" == "true" ]]; then
+            DROIDSPACES_NOTE="+ Droidspaces (Linux 容器, non-GKI) "
+          fi
+
           cat << EOF > release_notes.md
           ### PL2 SDM660 内核构建
           - 编译时间: ${TIME_FORM}
-          - 包含组件: ReSukiSU (Manual Hook) + AnyKernel3 刷入包
+          - 包含组件: ReSukiSU (Manual Hook) ${DROIDSPACES_NOTE}+ AnyKernel3 刷入包
           - 产物: \`Image.gz-dtb\` 与 \`AnyKernel3-PL2.zip\`
           EOF
 
